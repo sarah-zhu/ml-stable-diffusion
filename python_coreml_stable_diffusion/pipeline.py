@@ -63,6 +63,8 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
                          PNDMScheduler],
         tokenizer: CLIPTokenizer,
         controlnet: Optional[List[CoreMLModel]],
+        clip_image_encoder: Optional[CoreMLModel],
+        fuse_module: Optional[CoreMLModel],
     ):
         super().__init__()
 
@@ -452,7 +454,8 @@ def get_coreml_pipe(pytorch_pipe,
                     compute_unit,
                     delete_original_pipe=True,
                     scheduler_override=None,
-                    controlnet_models=None):
+                    controlnet_models=None,
+                    fastcomposer_models=None):
     """ Initializes and returns a `CoreMLStableDiffusionPipeline` from an original
     diffusers PyTorch pipeline
     """
@@ -471,6 +474,9 @@ def get_coreml_pipe(pytorch_pipe,
     }
 
     model_names_to_load = ["text_encoder", "unet", "vae_decoder"]
+    if fastcomposer_models:
+        model_names_to_load = ["clip_image_encoder", "fuse_module"]
+
     if getattr(pytorch_pipe, "safety_checker", None) is not None:
         model_names_to_load.append("safety_checker")
     else:
@@ -561,7 +567,8 @@ def main(args):
                                   model_version=args.model_version,
                                   compute_unit=args.compute_unit,
                                   scheduler_override=user_specified_scheduler,
-                                  controlnet_models=args.controlnet)
+                                  controlnet_models=args.controlnet,
+                                  fastcomposer_models=args.fastcomposer)
 
     if args.controlnet:
         controlnet_cond = []
@@ -651,6 +658,11 @@ if __name__ == "__main__":
         "--negative-prompt",
         default=None,
         help="The negative text prompt to be used for text-to-image generation.")
+    parser.add_argument(
+        "--fastcomposer",
+        nargs="*", 
+        type=str,
+        help=("Enables fastcomposer and add post fuse module into pipeline"))
 
     args = parser.parse_args()
     main(args)

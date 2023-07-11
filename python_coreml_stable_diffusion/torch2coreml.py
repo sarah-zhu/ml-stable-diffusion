@@ -4,7 +4,7 @@
 #
 
 from python_coreml_stable_diffusion import (
-    unet, controlnet, chunk_mlprogram
+    unet, controlnet, chunk_mlprogram, faster_composer
 )
 
 import argparse
@@ -1154,6 +1154,251 @@ def convert_controlnet(pipe, args):
         gc.collect()
 
 
+def fuse_object_embeddings(
+    inputs_embeds,
+    image_token_mask,
+    object_embeds,
+    num_objects,
+    fuse_fn=torch.add,
+):
+    object_embeds = object_embeds.to(inputs_embeds.dtype)
+
+    batch_size, max_num_objects = object_embeds.shape[:2]
+    seq_length = inputs_embeds.shape[1]
+    hidden_dim = inputs_embeds.shape[-1]
+    flat_object_embeds = object_embeds.view(
+        -1, object_embeds.shape[-2], object_embeds.shape[-1]
+    )
+
+    valid_object_mask = (
+        torch.arange(max_num_objects, device=flat_object_embeds.device)[None, :]
+        < num_objects[:, None]
+    )
+
+    valid_object_embeds = flat_object_embeds[valid_object_mask.flatten()]
+    inputs_embeds = inputs_embeds.view(-1, inputs_embeds.shape[-1])
+    image_token_mask = image_token_mask.view(-1)
+    valid_object_embeds = valid_object_embeds.view(-1, valid_object_embeds.shape[-1])
+
+    # slice out the image token embeddings
+    image_token_embeds = inputs_embeds[image_token_mask]
+    valid_object_embeds = fuse_fn(image_token_embeds, valid_object_embeds)
+    # inputs_embeds.masked_scatter_(image_token_mask[:, None], valid_object_embeds)
+    image_token_mask = image_token_mask.view((seq_length, 1)).repeat(1, hidden_dim)
+    inputs_embeds[image_token_mask] = valid_object_embeds
+    return inputs_embeds.view(batch_size, seq_length, -1)
+    
+
+
+def convert_fuse_module(pipe, args):
+    out_path = _get_out_path(args, "fuse_module")
+    # if os.path.exists(out_path):
+    #     logger.info(
+    #         f"`fuse_module` already exists at {out_path}, skipping conversion."
+    #     )
+    #     return
+    
+    text_encoder_sequence_length = pipe.tokenizer.model_max_length
+    text_encoder_hidden_size = args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size
+
+    num_objects = 1
+
+    text_embeds_shape = (1, text_encoder_sequence_length, text_encoder_hidden_size)
+    object_embeds_shape = (1, num_objects, 1, text_encoder_hidden_size)
+    image_token_mask_shape = (1, text_encoder_sequence_length)
+
+    sample_fuse_module_inputs = {
+        "text_embeds": torch.rand(*text_embeds_shape), 
+        "object_embeds": torch.rand(*object_embeds_shape),
+        "image_token_mask": torch.rand(*image_token_mask_shape) > 1,
+        "num_objects": torch.tensor([1], dtype=torch.int32)
+    }
+    sample_fuse_module_inputs["image_token_mask"][0][1] = True
+
+    sample_fuse_module_inputs_spec = {
+        k: (v.shape, v.dtype)
+        for k, v in sample_fuse_module_inputs.items()
+    }
+    logger.info(f"Sample inputs spec: {sample_fuse_module_inputs_spec}")
+    
+
+    class FastComposerPostfuseModule(nn.Module):
+        def __init__(self, embed_dim):
+            super().__init__()
+
+            fuse_model = faster_composer.FastComposerPostfuse.from_pretrained(args.model_version, subfolder="fuse")
+
+            self.mlp1 = fuse_model.mlp1
+            self.mlp2 = fuse_model.mlp2
+            self.layer_norm = fuse_model.layer_norm
+
+        def fuse_fn(self, text_embeds, object_embeds):
+            text_object_embeds = torch.cat([text_embeds, object_embeds], dim=-1)
+            text_object_embeds = self.mlp1(text_object_embeds) + text_embeds
+            text_object_embeds = self.mlp2(text_object_embeds)
+            text_object_embeds = self.layer_norm(text_object_embeds)
+            return text_object_embeds
+
+        def forward(
+            self,
+            text_embeds,
+            object_embeds,
+            image_token_mask,
+            num_objects,
+        ) -> torch.Tensor:
+            text_object_embeds = fuse_object_embeddings(
+                text_embeds, image_token_mask, object_embeds, num_objects, self.fuse_fn
+            )
+            return text_object_embeds 
+
+    fuse_module = FastComposerPostfuseModule(embed_dim=text_encoder_hidden_size).eval()
+
+    logger.info("JIT tracing..")
+    fuse_module = torch.jit.trace(fuse_module, list(sample_fuse_module_inputs.values()))
+    logger.info("Done.")
+
+
+    modify_coremltools_torch_frontend_badbmm()
+    coreml_fuse_module, out_path = _convert_to_coreml(
+        "fuse_module", fuse_module, sample_fuse_module_inputs,
+        ["fused_embedding"], args
+    )
+
+    # Set model metadata
+    coreml_fuse_module.author = f"FastComposer: Tuning-Free Multi-Subject Image Generation with Localized Attention"
+    coreml_fuse_module.version = "please check: https://github.com/mit-han-lab/fastcomposer"
+    coreml_fuse_module.short_description = \
+        "The PostFuse module in FastComposer to enable efficient, personalized, multi-subject text-to-image generation without fine-tuning."
+
+    # Set the input descriptions
+    coreml_fuse_module.input_description["text_embeds"] = "text embedding"
+    coreml_fuse_module.input_description["object_embeds"] = "object embedding"
+    coreml_fuse_module.input_description["image_token_mask"] = "mask of image token for <|image|>"
+    coreml_fuse_module.input_description["num_objects"] = "number of objects to generate"
+
+    # Set the output descriptions
+    coreml_fuse_module.output_description["fused_embedding"] = "The fused embeddings of text embedding and object embedding."
+
+    _save_mlpackage(coreml_fuse_module, out_path)
+
+    logger.info(f"Saved fuse_module into {out_path}")
+
+
+    if args.check_output_correctness:
+        baseline_out = fuse_module(*sample_fuse_module_inputs.values())[0].numpy()
+
+        coreml_sample_fuse_module_inputs = {}
+        coreml_sample_fuse_module_inputs["text_embeds"] = sample_fuse_module_inputs["text_embeds"].numpy().astype(np.float16)
+        coreml_sample_fuse_module_inputs["object_embeds"] = sample_fuse_module_inputs["object_embeds"].numpy().astype(np.float16)
+        coreml_sample_fuse_module_inputs["image_token_mask"] = sample_fuse_module_inputs["image_token_mask"].numpy().astype(np.int32)
+        coreml_sample_fuse_module_inputs["num_objects"] = sample_fuse_module_inputs["num_objects"].numpy().astype(np.int32)
+
+        coreml_out = list(
+            coreml_fuse_module.predict(coreml_sample_fuse_module_inputs).values())[0]
+
+        report_correctness(baseline_out, coreml_out,
+                               "unet baseline PyTorch to reference CoreML")
+
+    
+
+    del fuse_module, coreml_fuse_module
+    gc.collect()
+
+
+
+def convert_clip_image_encoder(pipe, args):
+    """ Converts the image encoder component of Stable Diffusion
+    """
+    out_path = _get_out_path(args, "clip_image_encoder")
+    if os.path.exists(out_path):
+        logger.info(
+            f"`clip_image_encoder` already exists at {out_path}, skipping conversion."
+        )
+        return
+
+    height = 224
+    width = 224
+    
+    z_shape = (
+        1,  # B
+        3,  # C (RGB range from -1 to 1)
+        height,  # H
+        width,  # w
+    )
+
+    sample_image_encoder_inputs = {
+        "z": torch.rand(*z_shape, dtype=torch.float16)
+    }
+
+
+    class CLIPImageEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            from transformers.models.clip.modeling_clip import CLIPModel
+            import torchvision.transforms as T
+            import torch.nn.functional as F
+
+            clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+            self.vision_model = clip_model.vision_model
+            self.visual_projection = clip_model.visual_projection
+            self.vision_processor = T.Normalize(
+                (0.48145466, 0.4578275, 0.40821073),
+                (0.26862954, 0.26130258, 0.27577711),
+            )
+
+        def forward(self, z):
+            z = self.vision_processor(z)
+            image_embedding = self.vision_model(z)[1]
+            image_embedding = self.visual_projection(image_embedding)
+            image_embedding = image_embedding.view(1, 1, 1, -1)
+            return image_embedding
+
+
+    image_encoder = CLIPImageEncoder().eval()
+
+    # No optimization needed for the VAE Encoder as it is a pure ConvNet
+    image_encoder = torch.jit.trace(image_encoder, (sample_image_encoder_inputs["z"].to(torch.float32), ))
+
+    modify_coremltools_torch_frontend_badbmm()
+    coreml_image_encoder, out_path = _convert_to_coreml(
+        "clip_image_encoder", image_encoder, sample_image_encoder_inputs,
+        ["image_embedding"], args)
+
+    # Set model metadata
+    coreml_image_encoder.author = f"Please refer to the Model Card available at huggingface.co/openai/clip-vit-large-patch14"
+    coreml_image_encoder.version = "openai/clip-vit-large-patch14"
+    coreml_image_encoder.short_description = \
+        "The CLIP model was developed by researchers at OpenAI to learn about what contributes to robustness in computer vision tasks."
+
+    # Set the input descriptions
+    coreml_image_encoder.input_description["z"] = \
+        "The input image to extract object embeddings with range [0, 255]"
+
+    # Set the output descriptions
+    coreml_image_encoder.output_description["image_embedding"] = "The latent embeddings from the clip image model from the input image."
+
+    _save_mlpackage(coreml_image_encoder, out_path)
+
+    logger.info(f"Saved image_encoder into {out_path}")
+
+    # Parity check PyTorch vs CoreML
+    if args.check_output_correctness:
+        baseline_out = image_encoder(
+            z=sample_image_encoder_inputs["z"].to(torch.float32)).numpy()
+        coreml_out = list(
+            coreml_image_encoder.predict(
+                {k: v.numpy()
+                 for k, v in sample_image_encoder_inputs.items()}).values())[0]
+        report_correctness(baseline_out, coreml_out,
+                           "image_encoder baseline PyTorch to baseline CoreML")
+
+    del image_encoder, coreml_image_encoder
+    gc.collect()
+
+
+
+
+
 def main(args):
     os.makedirs(args.o, exist_ok=True)
 
@@ -1202,6 +1447,16 @@ def main(args):
         convert_safety_checker(pipe, args)
         logger.info("Converted safety_checker")
 
+    if args.convert_clip_image_encoder:
+        logger.info("Converting convert_clip_image_encoder")
+        convert_clip_image_encoder(pipe, args)
+        logger.info("Converted convert_clip_image_encoder")
+
+    if args.convert_fuse_module:
+        logger.info("Converting convert_fuse_module")
+        convert_fuse_module(pipe, args)
+        logger.info("Converted convert_fuse_module")
+
     if args.quantize_nbits is not None:
         logger.info(f"Quantizing weights to {args.quantize_nbits}-bit precision")
         quantize_weights(args)
@@ -1218,6 +1473,8 @@ def parser_spec():
 
     # Select which models to export (All are needed for text-to-image pipeline to function)
     parser.add_argument("--convert-text-encoder", action="store_true")
+    parser.add_argument("--convert-clip-image-encoder", action="store_true")
+    parser.add_argument("--convert-fuse-module", action="store_true")
     parser.add_argument("--convert-vae-decoder", action="store_true")
     parser.add_argument("--convert-vae-encoder", action="store_true")
     parser.add_argument("--convert-unet", action="store_true")
