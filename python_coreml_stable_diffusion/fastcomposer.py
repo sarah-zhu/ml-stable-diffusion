@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
@@ -53,3 +54,43 @@ class FastComposerPostfuse(ModelMixin, ConfigMixin):
         )
 
         return text_object_embeds
+
+
+
+
+def tokenize_and_mask_noun_phrases_ends(tokenizer, caption, image_token):
+
+    input_ids = tokenizer.encode(caption)
+
+    tokenizer.add_tokens([image_token], special_tokens=True)
+    image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+
+    noun_phrase_end_mask = [False for _ in input_ids]
+    clean_input_ids = []
+    clean_index = 0
+
+    for i, id in enumerate(input_ids):
+        if id == image_token_id:
+            noun_phrase_end_mask[clean_index - 1] = True
+        else:
+            clean_input_ids.append(id)
+            clean_index += 1
+
+    max_len = tokenizer.model_max_length
+
+    if len(clean_input_ids) > max_len:
+        clean_input_ids = clean_input_ids[:max_len]
+    else:
+        clean_input_ids = clean_input_ids + [tokenizer.pad_token_id] * (
+                max_len - len(clean_input_ids)
+        )
+
+    if len(noun_phrase_end_mask) > max_len:
+        noun_phrase_end_mask = noun_phrase_end_mask[:max_len]
+    else:
+        noun_phrase_end_mask = noun_phrase_end_mask + [False] * (
+                max_len - len(noun_phrase_end_mask)
+        )
+    return np.expand_dims(np.array(clean_input_ids), axis=0), np.expand_dims(np.array(noun_phrase_end_mask), axis=0)
+
+

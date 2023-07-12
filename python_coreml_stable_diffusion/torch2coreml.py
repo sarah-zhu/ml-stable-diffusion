@@ -4,7 +4,7 @@
 #
 
 from python_coreml_stable_diffusion import (
-    unet, controlnet, chunk_mlprogram, faster_composer
+    unet, controlnet, chunk_mlprogram, fastcomposer
 )
 
 import argparse
@@ -132,7 +132,6 @@ def _convert_to_coreml(submodule_name, torchscript_module, sample_inputs,
             compute_units=ct.ComputeUnit[args.compute_unit],
             # skip_model_load=True,
         )
-
         del torchscript_module
         gc.collect()
 
@@ -1226,7 +1225,7 @@ def convert_fuse_module(pipe, args):
         def __init__(self, embed_dim):
             super().__init__()
 
-            fuse_model = faster_composer.FastComposerPostfuse.from_pretrained(args.model_version, subfolder="fuse")
+            fuse_model = fastcomposer.FastComposerPostfuse.from_pretrained(args.model_version, subfolder="fuse")
 
             self.mlp1 = fuse_model.mlp1
             self.mlp2 = fuse_model.mlp2
@@ -1246,6 +1245,7 @@ def convert_fuse_module(pipe, args):
             image_token_mask,
             num_objects,
         ) -> torch.Tensor:
+            image_token_mask = image_token_mask.to(torch.bool)
             text_object_embeds = fuse_object_embeddings(
                 text_embeds, image_token_mask, object_embeds, num_objects, self.fuse_fn
             )
@@ -1290,7 +1290,7 @@ def convert_fuse_module(pipe, args):
         coreml_sample_fuse_module_inputs = {}
         coreml_sample_fuse_module_inputs["text_embeds"] = sample_fuse_module_inputs["text_embeds"].numpy().astype(np.float16)
         coreml_sample_fuse_module_inputs["object_embeds"] = sample_fuse_module_inputs["object_embeds"].numpy().astype(np.float16)
-        coreml_sample_fuse_module_inputs["image_token_mask"] = sample_fuse_module_inputs["image_token_mask"].numpy().astype(np.int32)
+        coreml_sample_fuse_module_inputs["image_token_mask"] = sample_fuse_module_inputs["image_token_mask"].numpy().astype(np.float32)
         coreml_sample_fuse_module_inputs["num_objects"] = sample_fuse_module_inputs["num_objects"].numpy().astype(np.int32)
 
         coreml_out = list(
