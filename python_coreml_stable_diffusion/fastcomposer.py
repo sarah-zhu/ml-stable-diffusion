@@ -59,11 +59,10 @@ class FastComposerPostfuse(ModelMixin, ConfigMixin):
 
 
 def tokenize_and_mask_noun_phrases_ends(tokenizer, caption, image_token):
-
-    input_ids = tokenizer.encode(caption)
-
     tokenizer.add_tokens([image_token], special_tokens=True)
     image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+
+    input_ids = tokenizer.encode(caption)
 
     noun_phrase_end_mask = [False for _ in input_ids]
     clean_input_ids = []

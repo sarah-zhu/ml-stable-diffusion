@@ -42,6 +42,7 @@ from transformers import CLIPFeatureExtractor, CLIPTokenizer
 from typing import List, Optional, Union
 from PIL import Image
 
+IMAGE_TOKEN = "<|image|>"
 
 class CoreMLStableDiffusionPipeline(DiffusionPipeline):
     """ Core ML version of
@@ -97,6 +98,10 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
 
         self.vae_decoder = vae_decoder
 
+        self.clip_image_encoder = clip_image_encoder
+
+        self.fuse_module = fuse_module
+
         VAE_DECODER_UPSAMPLE_FACTOR = 8
 
         # In PyTorch, users can determine the tensor shapes dynamically by default
@@ -110,29 +115,52 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             f"Stable Diffusion configured to generate {self.height}x{self.width} images"
         )
 
-    def _encode_prompt(self, prompt, num_images_per_prompt,
-                       do_classifier_free_guidance, negative_prompt):
+    def _encode_prompt(self, prompt, image, num_images_per_prompt,
+                       do_classifier_free_guidance, negative_prompt, fastcomposer=False):
         batch_size = len(prompt) if isinstance(prompt, list) else 1
 
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="np",
-        )
-        text_input_ids = text_inputs.input_ids
+        # extract object embeddings
+        if image is not None:
+            object_embeddings = self.clip_image_encoder(z=image)["image_embedding"]
+            print("object_embeddings: ", object_embeddings.shape, object_embeddings.dtype)
 
-        if text_input_ids.shape[-1] > self.tokenizer.model_max_length:
-            removed_text = self.tokenizer.batch_decode(
-                text_input_ids[:, self.tokenizer.model_max_length:])
-            logger.warning(
-                "The following part of your input was truncated because CLIP can only handle sequences up to"
-                f" {self.tokenizer.model_max_length} tokens: {removed_text}")
-            text_input_ids = text_input_ids[:, :self.tokenizer.
-                                            model_max_length]
+        if fastcomposer:
+            from python_coreml_stable_diffusion.fastcomposer import tokenize_and_mask_noun_phrases_ends
+            # extract subject token and mask from caption
+            caption_tokens, image_token_mask = tokenize_and_mask_noun_phrases_ends(self.tokenizer, prompt, IMAGE_TOKEN)
+            num_objects = np.expand_dims(image_token_mask.sum(), axis=0).astype(np.int32)
 
-        text_embeddings = self.text_encoder(
-            input_ids=text_input_ids.astype(np.float32))["last_hidden_state"]
+            text_embeddings = self.text_encoder(input_ids=caption_tokens.astype(np.float32))["last_hidden_state"]
+
+            print("num_objects: ", num_objects)
+            print("image_token_mask: ", image_token_mask.shape, image_token_mask.dtype)
+            print("text_embeddings: ", text_embeddings.shape, text_embeddings.dtype)
+
+            augmented_embeddings = self.fuse_module(text_embeds=text_embeddings,
+                object_embeds=object_embeddings,
+                image_token_mask=image_token_mask.astype(np.int32),
+                num_objects=num_objects
+            )["fused_embedding"]
+        else:
+            text_inputs = self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="np",
+            )
+            text_input_ids = text_inputs.input_ids
+
+            if text_input_ids.shape[-1] > self.tokenizer.model_max_length:
+                removed_text = self.tokenizer.batch_decode(
+                    text_input_ids[:, self.tokenizer.model_max_length:])
+                logger.warning(
+                    "The following part of your input was truncated because CLIP can only handle sequences up to"
+                    f" {self.tokenizer.model_max_length} tokens: {removed_text}")
+                text_input_ids = text_input_ids[:, :self.tokenizer.
+                                                model_max_length]
+
+            text_embeddings = self.text_encoder(
+                input_ids=text_input_ids.astype(np.float32))["last_hidden_state"]
 
         if do_classifier_free_guidance:
             uncond_tokens: List[str]
@@ -152,11 +180,11 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             else:
                 uncond_tokens = negative_prompt
 
-            max_length = text_input_ids.shape[-1]
+
             uncond_input = self.tokenizer(
                 uncond_tokens,
                 padding="max_length",
-                max_length=max_length,
+                max_length=self.tokenizer.model_max_length,
                 truncation=True,
                 return_tensors="np",
             )
@@ -168,12 +196,16 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            text_embeddings = np.concatenate(
-                [uncond_embeddings, text_embeddings])
+            text_embeddings = np.concatenate([uncond_embeddings, text_embeddings])
+            if fastcomposer:
+                augmented_embeddings = np.concatenate([uncond_embeddings, augmented_embeddings])
 
         text_embeddings = text_embeddings.transpose(0, 2, 1)[:, :, None, :]
 
-        return text_embeddings
+        if fastcomposer:
+            return text_embeddings, augmented_embeddings.transpose(0, 2, 1)[:, :, None, :]
+        else:
+            return text_embeddings
 
     def run_controlnet(self, 
                        sample, 
@@ -311,6 +343,7 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
     def __call__(
         self,
         prompt,
+        image=None,
         height=512,
         width=512,
         num_inference_steps=50,
@@ -324,6 +357,7 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
         callback=None,
         callback_steps=1,
         controlnet_cond=None,
+        fastcomposer=False,
         **kwargs,
     ):
         # 1. Check inputs. Raise error if not correct
@@ -342,12 +376,20 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        text_embeddings = self._encode_prompt(
+        encoded_embeddings = self._encode_prompt(
             prompt,
+            image,
             num_images_per_prompt,
             do_classifier_free_guidance,
             negative_prompt,
+            fastcomposer=True
         )
+
+
+        if fastcomposer:
+            text_embeddings, augmented_embeddings = encoded_embeddings[0], encoded_embeddings[1]
+        else:
+            text_embeddings = encoded_embeddings
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps)
@@ -393,11 +435,19 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             else:
                 additional_residuals = {}
 
+            if fastcomposer:
+                if i < 10:
+                    condition = text_embeddings.astype(np.float16)
+                else:
+                    condition = augmented_embeddings.astype(np.float16)
+            else:
+                condition = text_embeddings.astype(np.float16)
+
             # predict the noise residual
             noise_pred = self.unet(
                 sample=latent_model_input.astype(np.float16),
                 timestep=np.array([t, t], np.float16),
-                encoder_hidden_states=text_embeddings.astype(np.float16),
+                encoder_hidden_states=condition,
                 **additional_residuals,
             )["noise_pred"]
 
@@ -455,7 +505,7 @@ def get_coreml_pipe(pytorch_pipe,
                     delete_original_pipe=True,
                     scheduler_override=None,
                     controlnet_models=None,
-                    fastcomposer_models=None):
+                    fastcomposer_models=False):
     """ Initializes and returns a `CoreMLStableDiffusionPipeline` from an original
     diffusers PyTorch pipeline
     """
@@ -475,7 +525,8 @@ def get_coreml_pipe(pytorch_pipe,
 
     model_names_to_load = ["text_encoder", "unet", "vae_decoder"]
     if fastcomposer_models:
-        model_names_to_load = ["clip_image_encoder", "fuse_module"]
+        model_names_to_load.extend(["clip_image_encoder", "fuse_module"])
+
 
     if getattr(pytorch_pipe, "safety_checker", None) is not None:
         model_names_to_load.append("safety_checker")
@@ -517,6 +568,9 @@ def get_coreml_pipe(pytorch_pipe,
         )
         for model_name in model_names_to_load
     })
+    if not fastcomposer_models:
+        coreml_pipe_kwargs['clip_image_encoder'] = None
+        coreml_pipe_kwargs['fuse_module'] = None
     logger.info("Done.")
 
     logger.info("Initializing Core ML pipe for image generation")
@@ -548,13 +602,37 @@ def prepare_controlnet_cond(image_path, height, width):
     image = np.array(image).transpose(2, 0, 1) / 255.0
     return image
 
+
+def get_object_transform(object_resolution):
+    from python_coreml_stable_diffusion.transforms import PadToSquare
+    from collections import OrderedDict
+    import torchvision.transforms as T
+    object_transforms = torch.nn.Sequential(
+        OrderedDict(
+            [
+                ("pad_to_square", PadToSquare(fill=0, padding_mode="constant")),
+                (
+                    "resize",
+                    T.Resize(
+                        (object_resolution, object_resolution),
+                        interpolation=T.InterpolationMode.BILINEAR,
+                        antialias=True,
+                    ),
+                ),
+                ("convert_to_float", T.ConvertImageDtype(torch.float32)),
+            ]
+        )
+    )
+    return object_transforms
+
+
 def main(args):
     logger.info(f"Setting random seed to {args.seed}")
     np.random.seed(args.seed)
 
     logger.info("Initializing PyTorch pipe for reference configuration")
     from diffusers import StableDiffusionPipeline
-    pytorch_pipe = StableDiffusionPipeline.from_pretrained(args.model_version,
+    pytorch_pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4",
                                                            use_auth_token=True)
 
     user_specified_scheduler = None
@@ -580,14 +658,25 @@ def main(args):
         controlnet_cond = None
 
     logger.info("Beginning image generation.")
+    if args.image:
+        from torchvision.io import read_image, ImageReadMode
+        image = read_image(args.image, mode=ImageReadMode.RGB)
+        object_transforms = get_object_transform(object_resolution=224)
+        image = object_transforms(image)
+        image = np.expand_dims(image, axis=0)
+
+    else:
+        image = None
     image = coreml_pipe(
         prompt=args.prompt,
+        image=image,
         height=coreml_pipe.height,
         width=coreml_pipe.width,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         controlnet_cond=controlnet_cond,
         negative_prompt=args.negative_prompt,
+        fastcomposer=args.fastcomposer
     )
 
     out_path = get_image_path(args)
@@ -602,6 +691,11 @@ if __name__ == "__main__":
         "--prompt",
         required=True,
         help="The text prompt to be used for text-to-image generation.")
+    parser.add_argument(
+        "--image",
+        type=str,
+        default="",
+        help="The input image for fastcomposer usage only.")
     parser.add_argument(
         "-i",
         required=True,
@@ -660,8 +754,7 @@ if __name__ == "__main__":
         help="The negative text prompt to be used for text-to-image generation.")
     parser.add_argument(
         "--fastcomposer",
-        nargs="*", 
-        type=str,
+        action="store_true",
         help=("Enables fastcomposer and add post fuse module into pipeline"))
 
     args = parser.parse_args()

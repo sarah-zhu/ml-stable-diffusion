@@ -1213,6 +1213,7 @@ def convert_fuse_module(pipe, args):
         "num_objects": torch.tensor([1], dtype=torch.int32)
     }
     sample_fuse_module_inputs["image_token_mask"][0][1] = True
+    sample_fuse_module_inputs["image_token_mask"] = sample_fuse_module_inputs["image_token_mask"].to(torch.int32)
 
     sample_fuse_module_inputs_spec = {
         k: (v.shape, v.dtype)
@@ -1327,18 +1328,16 @@ def convert_clip_image_encoder(pipe, args):
     )
 
     sample_image_encoder_inputs = {
-        "z": torch.rand(*z_shape, dtype=torch.float16)
+        "z": torch.rand(*z_shape, dtype=torch.float32)
     }
-
 
     class CLIPImageEncoder(nn.Module):
         def __init__(self):
             super().__init__()
             from transformers.models.clip.modeling_clip import CLIPModel
             import torchvision.transforms as T
-            import torch.nn.functional as F
 
-            clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+            clip_model = CLIPModel.from_pretrained(args.model_version, subfolder="clip_image_encoder")
             self.vision_model = clip_model.vision_model
             self.visual_projection = clip_model.visual_projection
             self.vision_processor = T.Normalize(
