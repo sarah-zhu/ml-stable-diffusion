@@ -230,7 +230,9 @@ def bundle_resources_for_swift_cli(args):
                                      ("control-unet", "ControlledUnet"),
                                      ("control-unet_chunk1", "ControlledUnetChunk1"),
                                      ("control-unet_chunk2", "ControlledUnetChunk2"),
-                                     ("safety_checker", "SafetyChecker")]:
+                                     ("safety_checker", "SafetyChecker"),
+                                     ("clip_image_encoder", "ClipImageEncoder"),
+                                     ("fuse_module", "FuseModule")]:
         source_path = _get_out_path(args, source_name)
         if os.path.exists(source_path):
             target_path = _compile_coreml_model(source_path, resources_dir,
@@ -1404,7 +1406,7 @@ def main(args):
     # Instantiate diffusers pipe as reference
     logger.info(
         f"Initializing StableDiffusionPipeline with {args.model_version}..")
-    pipe = StableDiffusionPipeline.from_pretrained(args.model_version,
+    pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4",
                                                    use_auth_token=True)
     logger.info("Done.")
 
