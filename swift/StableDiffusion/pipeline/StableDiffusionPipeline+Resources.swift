@@ -24,6 +24,8 @@ public extension StableDiffusionPipeline {
         public let controlledUnetChunk1URL: URL
         public let controlledUnetChunk2URL: URL
         public let multilingualTextEncoderProjectionURL: URL
+        public let featureExtractorURL: URL
+        public let postfuserURL: URL
 
         public init(resourcesAt baseURL: URL) {
             textEncoderURL = baseURL.appending(path: "TextEncoder.mlmodelc")
@@ -40,6 +42,8 @@ public extension StableDiffusionPipeline {
             controlledUnetChunk1URL = baseURL.appending(path: "ControlledUnetChunk1.mlmodelc")
             controlledUnetChunk2URL = baseURL.appending(path: "ControlledUnetChunk2.mlmodelc")
             multilingualTextEncoderProjectionURL = baseURL.appending(path: "MultilingualTextEncoderProjection.mlmodelc")
+            featureExtractorURL = baseURL.appending(path: "ClipImageEncoder.mlmodelc")
+            postfuserURL = baseURL.appending(path: "FuseModule.mlmodelc")
         }
     }
 
@@ -131,6 +135,23 @@ public extension StableDiffusionPipeline {
         } else {
             encoder = nil
         }
+        
+        // Optional feature extractor
+        let featureExtractor: FeatureExtractor?
+        if FileManager.default.fileExists(atPath: urls.featureExtractorURL.path) {
+            featureExtractor = FeatureExtractor(modelAt: urls.featureExtractorURL, configuration: config)
+        } else {
+            featureExtractor = nil
+        }
+        
+        // Optional postfuse module
+        let postFuser: PostFuser?
+        if FileManager.default.fileExists(atPath: urls.postfuserURL.path) {
+            postFuser = PostFuser(modelAt: urls.postfuserURL, configuration: config)
+        } else {
+            postFuser = nil
+        }
+        
 
         // Construct pipeline
         if #available(macOS 14.0, iOS 17.0, *) {
@@ -140,6 +161,8 @@ public extension StableDiffusionPipeline {
                 decoder: decoder,
                 encoder: encoder,
                 controlNet: controlNet,
+                featureExtractor: featureExtractor,
+                postFuser: postFuser,
                 safetyChecker: safetyChecker,
                 reduceMemory: reduceMemory,
                 useMultilingualTextEncoder: useMultilingualTextEncoder,
@@ -152,6 +175,8 @@ public extension StableDiffusionPipeline {
                 decoder: decoder,
                 encoder: encoder,
                 controlNet: controlNet,
+                featureExtractor: featureExtractor,
+                postFuser: postFuser,
                 safetyChecker: safetyChecker,
                 reduceMemory: reduceMemory
             )

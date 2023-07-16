@@ -52,6 +52,12 @@ public struct StableDiffusionPipeline: ResourceManaging {
     
     /// Optional model used before Unet to control generated images by additonal inputs
     var controlNet: ControlNet? = nil
+    
+    /// Optional model used to extract image features
+    var featureExtractor: FeatureExtractor? = nil
+    
+    /// Optional model to fuse text embeddings and image features
+    var postFuser: PostFuser? = nil
 
     /// Reports whether this pipeline can perform safety checks
     public var canSafetyCheck: Bool {
@@ -79,6 +85,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
     ///   - unet: Model for noise prediction on latent samples
     ///   - decoder: Model for decoding latent sample to image
     ///   - controlNet: Optional model to control generated images by additonal inputs
+    ///   - featureExtractor: Optional model used to extract features from input image
+    ///   - postFuser: Optional model to fuse text embeddings and image features
     ///   - safetyChecker: Optional model for checking safety of generated images
     ///   - reduceMemory: Option to enable reduced memory mode
     /// - Returns: Pipeline ready for image generation
@@ -88,6 +96,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
         decoder: Decoder,
         encoder: Encoder?,
         controlNet: ControlNet? = nil,
+        featureExtractor: FeatureExtractor? = nil,
+        postFuser: PostFuser? = nil,
         safetyChecker: SafetyChecker? = nil,
         reduceMemory: Bool = false
     ) {
@@ -96,6 +106,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
         self.decoder = decoder
         self.encoder = encoder
         self.controlNet = controlNet
+        self.featureExtractor = featureExtractor
+        self.postFuser = postFuser
         self.safetyChecker = safetyChecker
         self.reduceMemory = reduceMemory
     }
@@ -107,6 +119,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
     ///   - unet: Model for noise prediction on latent samples
     ///   - decoder: Model for decoding latent sample to image
     ///   - controlNet: Optional model to control generated images by additonal inputs
+    ///   - featureExtractor: Optional model used to extract features from input image
+    ///   - postFuser: Optional model to fuse text embeddings and image features
     ///   - safetyChecker: Optional model for checking safety of generated images
     ///   - reduceMemory: Option to enable reduced memory mode
     ///   - useMultilingualTextEncoder: Option to use system multilingual NLContextualEmbedding as encoder
@@ -119,6 +133,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
         decoder: Decoder,
         encoder: Encoder?,
         controlNet: ControlNet? = nil,
+        featureExtractor: FeatureExtractor? = nil,
+        postFuser: PostFuser? = nil,
         safetyChecker: SafetyChecker? = nil,
         reduceMemory: Bool = false,
         useMultilingualTextEncoder: Bool = false,
@@ -129,6 +145,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
         self.decoder = decoder
         self.encoder = encoder
         self.controlNet = controlNet
+        self.featureExtractor = featureExtractor
+        self.postFuser = postFuser
         self.safetyChecker = safetyChecker
         self.reduceMemory = reduceMemory
         self.useMultilingualTextEncoder = useMultilingualTextEncoder
@@ -148,6 +166,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
             try decoder.loadResources()
             try encoder?.loadResources()
             try controlNet?.loadResources()
+            try featureExtractor?.loadResources()
+            try postFuser?.loadResources()
             try safetyChecker?.loadResources()
         }
     }
@@ -159,6 +179,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
         decoder.unloadResources()
         encoder?.unloadResources()
         controlNet?.unloadResources()
+        featureExtractor?.unloadResources()
+        postFuser?.unloadResources()
         safetyChecker?.unloadResources()
     }
 
@@ -169,6 +191,8 @@ public struct StableDiffusionPipeline: ResourceManaging {
         try decoder.prewarmResources()
         try encoder?.prewarmResources()
         try controlNet?.prewarmResources()
+        try featureExtractor?.prewarmResources()
+        try postFuser?.prewarmResources()
         try safetyChecker?.prewarmResources()
     }
 
@@ -182,15 +206,44 @@ public struct StableDiffusionPipeline: ResourceManaging {
         configuration config: Configuration,
         progressHandler: (Progress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
+        
+        var prompt: String
+        var dict = [String: Any]()
+        // preprocess on the prompt
+//        if let specialToken = config.specialToken {
+        if true {
+            let specialToken = "<|image|></w>"
+            dict = preprocessPrompt(prompt: config.prompt, specialToken: specialToken)
+            prompt = dict["prompt"] as! String
+        } else {
+            prompt = config.prompt
+        }
 
         // Encode the input prompt and negative prompt
-        let promptEmbedding = try textEncoder.encode(config.prompt)
+        let promptEmbedding = try textEncoder.encode(prompt)
         let negativePromptEmbedding = try textEncoder.encode(config.negativePrompt)
 
         if reduceMemory {
             textEncoder.unloadResources()
         }
-
+        
+        // extract features from image
+        var fusedEmbedding: MLShapedArray<Float32>? = nil
+        if let featureExtractor, postFuser != nil, config.startingImage != nil {
+            let imageEmebedding = try featureExtractor.encode(config.startingImage!)
+            print("promptEmbedding: \(promptEmbedding.shape)")
+            print("imageEmebedding: \(imageEmebedding.shape)")
+            fusedEmbedding = try postFuser!.fuse(textEmbeddings: promptEmbedding, imageEmbeddings: imageEmebedding, imageTokenMask: dict["image_token_mask"] as! [Int32], numObjects: dict["numObjects"] as! [Int32])
+            print("post fuse output : \(promptEmbedding.shape)")
+            
+            if reduceMemory {
+                featureExtractor.unloadResources()
+                postFuser?.unloadResources()
+            }
+            
+        }
+        
+        
         // Convert to Unet hidden state representation
         // Concatenate the prompt and negative prompt embeddings
         let concatEmbedding = MLShapedArray<Float32>(
@@ -199,6 +252,15 @@ public struct StableDiffusionPipeline: ResourceManaging {
         )
 
         let hiddenStates = useMultilingualTextEncoder ? concatEmbedding : toHiddenStates(concatEmbedding)
+        var fusedHiddenStates: MLShapedArray<Float32>? = nil
+        
+        if fusedEmbedding != nil {
+            let fusedConcatEmbedding = MLShapedArray<Float32>(
+                concatenating: [negativePromptEmbedding, fusedEmbedding!],
+                alongAxis: 0
+            )
+            fusedHiddenStates = useMultilingualTextEncoder ? fusedConcatEmbedding : toHiddenStates(fusedConcatEmbedding)
+        }
 
         /// Setup schedulers
         let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
@@ -226,8 +288,9 @@ public struct StableDiffusionPipeline: ResourceManaging {
 
         // De-noising loop
         let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
+        
         for (step,t) in timeSteps.enumerated() {
-
+            print("step: \(step), t: \(t)")
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
             let latentUnetInput = latents.map {
@@ -247,7 +310,7 @@ public struct StableDiffusionPipeline: ResourceManaging {
             var noise = try unet.predictNoise(
                 latents: latentUnetInput,
                 timeStep: t,
-                hiddenStates: hiddenStates,
+                hiddenStates: step < 10 ? hiddenStates : fusedHiddenStates!,
                 additionalResiduals: additionalResiduals
             )
 
@@ -307,11 +370,10 @@ public struct StableDiffusionPipeline: ResourceManaging {
                 converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
         }
         if let image = config.startingImage, config.mode == .imageToImage {
-            guard let encoder else {
-                throw Error.startingImageProvidedWithoutEncoder
+            if let encoder {
+                let latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
+                return scheduler.addNoise(originalSample: latent, noise: samples, strength: config.strength)
             }
-            let latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
-            return scheduler.addNoise(originalSample: latent, noise: samples, strength: config.strength)
         }
         return samples
     }
@@ -378,6 +440,17 @@ public struct StableDiffusionPipeline: ResourceManaging {
         }
 
         return safeImages
+    }
+    
+    func preprocessPrompt(prompt: String, specialToken: String) -> [String: Any] {
+        let dict = textEncoder.getTokenMask(text: prompt, specialToken: specialToken)
+        let imageTokenMask = (dict["image_token_mask"] as! [Int]).map {Int32($0)}
+        let numObjects = [imageTokenMask.reduce(0, +)]
+        return [
+            "prompt" : dict["prompt"] as! String,
+            "image_token_mask" : imageTokenMask,
+            "numObjects": numObjects.map {Int32($0)}
+        ]
     }
 
 }

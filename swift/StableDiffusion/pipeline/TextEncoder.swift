@@ -7,6 +7,7 @@ import CoreML
 @available(iOS 16.2, macOS 13.1, *)
 public protocol TextEncoderModel: ResourceManaging {
 
+    func getTokenMask(text: String, specialToken: String) -> [String: Any]
     func encode(_ text: String) throws -> MLShapedArray<Float32>
 }
 
@@ -42,6 +43,43 @@ public struct TextEncoder: TextEncoderModel {
     /// Unload the underlying model to free up memory
     public func unloadResources() {
        model.unloadResources()
+    }
+    
+    public func getTokenMask(text: String, specialToken: String) -> [String: Any] {
+        let inputLength = inputShape.last!
+        
+        // tokenize the text and special token
+        let specialTokenId = tokenizer.tokenID(for: specialToken)
+        var (tokens, ids) = tokenizer.tokenize(input: text, minCount: inputLength)
+        
+        // Truncate if necessary
+        if ids.count > inputLength {
+            tokens = tokens.dropLast(tokens.count - inputLength)
+            ids = ids.dropLast(ids.count - inputLength)
+            let truncated = tokenizer.decode(tokens: tokens)
+            print("Needed to truncate input '\(text)' to '\(truncated)'")
+        }
+        
+        // get token mask
+        var idx = 0
+        var cleanedTokens = [String]()
+        var tokenMask = [Int](repeating: 0, count: inputLength)
+        for (token, tokenId) in zip(tokens, ids) {
+            if tokenId == specialTokenId {
+                tokenMask[idx-1] = 1
+            } else {
+                cleanedTokens.append(token)
+                idx += 1
+            }
+        }
+        
+        if inputLength > cleanedTokens.count {
+            tokens.append(contentsOf: repeatElement(tokenizer.padToken, count: inputLength - cleanedTokens.count))
+        }
+        return [
+            "prompt" : tokenizer.decode(tokens: cleanedTokens),
+            "image_token_mask" : tokenMask
+        ]
     }
 
     /// Encode input text/string

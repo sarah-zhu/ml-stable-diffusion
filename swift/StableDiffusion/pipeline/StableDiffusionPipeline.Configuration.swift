@@ -45,6 +45,8 @@ extension StableDiffusionPipeline {
         public var encoderScaleFactor: Float32 = 0.18215
         /// Scale factor to use on the latent before decoding
         public var decoderScaleFactor: Float32 = 0.18215
+        /// Special token used to generate image token mask
+        public var specialToken: String? = nil
         
         /// Given the configuration, what mode will be used for generation
         public var mode: Mode {
