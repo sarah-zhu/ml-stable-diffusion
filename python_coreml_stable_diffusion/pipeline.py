@@ -382,7 +382,7 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             num_images_per_prompt,
             do_classifier_free_guidance,
             negative_prompt,
-            fastcomposer=True
+            fastcomposer=fastcomposer
         )
 
 
