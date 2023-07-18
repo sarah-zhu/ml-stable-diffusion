@@ -47,6 +47,8 @@ extension StableDiffusionPipeline {
         public var decoderScaleFactor: Float32 = 0.18215
         /// Special token used to generate image token mask
         public var specialToken: String? = nil
+        ///start merging fused embedding during denoising
+        public var startMergeStep: Int = 50
         
         /// Given the configuration, what mode will be used for generation
         public var mode: Mode {

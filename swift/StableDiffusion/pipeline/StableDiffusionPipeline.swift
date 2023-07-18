@@ -208,13 +208,15 @@ public struct StableDiffusionPipeline: ResourceManaging {
     ) throws -> [CGImage?] {
         
         var prompt: String
-        var dict = [String: Any]()
+        var imageTokenMask = [Int32]()
+        var numObjects = [Int32]()
         
-        // preprocess on the prompt
+        // preprocess the prompt to remove the special token in prompt and get token mask
         if let specialToken = config.specialToken {
-            print("special token: \(specialToken)")
-            dict = preprocessPrompt(prompt: config.prompt, specialToken: specialToken+"</w>")
-            prompt = dict["prompt"] as! String
+            let result = preprocessPrompt(prompt: config.prompt, specialToken: specialToken+"</w>")
+            prompt = result.0
+            imageTokenMask = result.1
+            numObjects = result.2
         } else {
             prompt = config.prompt
         }
@@ -228,14 +230,24 @@ public struct StableDiffusionPipeline: ResourceManaging {
         }
         
         // extract features from image
-        var fusedEmbedding: MLShapedArray<Float32>? = nil
-        if let featureExtractor, postFuser != nil, config.startingImage != nil, !dict.isEmpty {
-            let imageEmebedding = try featureExtractor.encode(config.startingImage!)
-            fusedEmbedding = try postFuser!.fuse(textEmbeddings: promptEmbedding, imageEmbeddings: imageEmebedding, imageTokenMask: dict["image_token_mask"] as! [Int32], numObjects: dict["numObjects"] as! [Int32])
-
+        var imageEmebedding: MLShapedArray<Float32>? = nil
+        if let featureExtractor {
+            assert(config.startingImage != nil)
+            imageEmebedding = try featureExtractor.encode(config.startingImage!)
             if reduceMemory {
                 featureExtractor.unloadResources()
-                postFuser?.unloadResources()
+            }
+        }
+        
+        // fuse image embedding and prompt embedding
+        var fusedEmbedding: MLShapedArray<Float32>? = nil
+        if let postFuser {
+            assert(config.specialToken != nil)
+            assert(imageEmebedding != nil)
+            fusedEmbedding = try postFuser.fuse(textEmbeddings: promptEmbedding, imageEmbeddings: imageEmebedding!, imageTokenMask: imageTokenMask, numObjects: numObjects)
+
+            if reduceMemory {
+                postFuser.unloadResources()
             }
         }
         
@@ -246,13 +258,13 @@ public struct StableDiffusionPipeline: ResourceManaging {
             concatenating: [negativePromptEmbedding, promptEmbedding],
             alongAxis: 0
         )
-
         let hiddenStates = useMultilingualTextEncoder ? concatEmbedding : toHiddenStates(concatEmbedding)
-        var fusedHiddenStates: MLShapedArray<Float32>? = nil
         
-        if fusedEmbedding != nil {
+        // get fused hidden states if fusedEmbedding != nil
+        var fusedHiddenStates: MLShapedArray<Float32>? = nil
+        if let fusedEmbedding {
             let fusedConcatEmbedding = MLShapedArray<Float32>(
-                concatenating: [negativePromptEmbedding, fusedEmbedding!],
+                concatenating: [negativePromptEmbedding, fusedEmbedding],
                 alongAxis: 0
             )
             fusedHiddenStates = useMultilingualTextEncoder ? fusedConcatEmbedding : toHiddenStates(fusedConcatEmbedding)
@@ -286,7 +298,6 @@ public struct StableDiffusionPipeline: ResourceManaging {
         let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
         
         for (step,t) in timeSteps.enumerated() {
-            print("step: \(step), t: \(t)")
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
             let latentUnetInput = latents.map {
@@ -303,10 +314,11 @@ public struct StableDiffusionPipeline: ResourceManaging {
             
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
+            let condition = fusedHiddenStates != nil && step >= config.startMergeStep ? fusedHiddenStates! : hiddenStates
             var noise = try unet.predictNoise(
                 latents: latentUnetInput,
                 timeStep: t,
-                hiddenStates: (step < 10) || (fusedHiddenStates == nil) ? hiddenStates : fusedHiddenStates!,
+                hiddenStates: condition,
                 additionalResiduals: additionalResiduals
             )
 
@@ -438,15 +450,13 @@ public struct StableDiffusionPipeline: ResourceManaging {
         return safeImages
     }
     
-    func preprocessPrompt(prompt: String, specialToken: String) -> [String: Any] {
+    func preprocessPrompt(prompt: String, specialToken: String) -> (String, [Int32], [Int32]) {
         let dict = textEncoder.getTokenMask(text: prompt, specialToken: specialToken)
         let imageTokenMask = (dict["image_token_mask"] as! [Int]).map {Int32($0)}
         let numObjects = [imageTokenMask.reduce(0, +)]
-        return [
-            "prompt" : dict["prompt"] as! String,
-            "image_token_mask" : imageTokenMask,
-            "numObjects": numObjects.map {Int32($0)}
-        ]
+        return (dict["prompt"] as! String,
+                imageTokenMask,
+                numObjects.map {Int32($0)})
     }
 
 }
