@@ -119,12 +119,13 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
                        do_classifier_free_guidance, negative_prompt, fastcomposer=False):
         batch_size = len(prompt) if isinstance(prompt, list) else 1
 
-        # extract object embeddings
-        if image is not None:
+        if fastcomposer:
+            # extract object embeddings
+            if image is None:
+                raise ValueError("input image is not provided when fastcomposer is enable!")
             object_embeddings = self.clip_image_encoder(z=image)["image_embedding"]
             print("object_embeddings: ", object_embeddings.shape, object_embeddings.dtype)
 
-        if fastcomposer:
             from python_coreml_stable_diffusion.fastcomposer import tokenize_and_mask_noun_phrases_ends
             # extract subject token and mask from caption
             caption_tokens, image_token_mask = tokenize_and_mask_noun_phrases_ends(self.tokenizer, prompt, IMAGE_TOKEN)

@@ -1185,9 +1185,12 @@ def fuse_object_embeddings(
     image_token_embeds = inputs_embeds[image_token_mask]
     valid_object_embeds = fuse_fn(image_token_embeds, valid_object_embeds)
     # inputs_embeds.masked_scatter_(image_token_mask[:, None], valid_object_embeds)
-    image_token_mask = image_token_mask.view((seq_length, 1)).repeat(1, hidden_dim)
-    inputs_embeds[image_token_mask] = valid_object_embeds
-    return inputs_embeds.view(batch_size, seq_length, -1)
+    if valid_object_embeds.shape[0] == 0:
+        return inputs_embeds.view(batch_size, seq_length, -1)
+    else:
+        image_token_mask = image_token_mask.view((seq_length, 1)).repeat(1, hidden_dim)
+        inputs_embeds[image_token_mask] = valid_object_embeds
+        return inputs_embeds.view(batch_size, seq_length, -1)
     
 
 
@@ -1228,7 +1231,7 @@ def convert_fuse_module(pipe, args):
         def __init__(self, embed_dim):
             super().__init__()
 
-            fuse_model = fastcomposer.FastComposerPostfuse.from_pretrained(args.model_version, subfolder="fuse")
+            fuse_model = fastcomposer.FastComposerPostfuse.from_pretrained(args.pretrained_path, subfolder="fuse")
 
             self.mlp1 = fuse_model.mlp1
             self.mlp2 = fuse_model.mlp2
@@ -1300,7 +1303,7 @@ def convert_fuse_module(pipe, args):
             coreml_fuse_module.predict(coreml_sample_fuse_module_inputs).values())[0]
 
         report_correctness(baseline_out, coreml_out,
-                               "unet baseline PyTorch to reference CoreML")
+                               "postfuse baseline PyTorch to reference CoreML")
 
     
 
@@ -1339,7 +1342,7 @@ def convert_clip_image_encoder(pipe, args):
             from transformers.models.clip.modeling_clip import CLIPModel
             import torchvision.transforms as T
 
-            clip_model = CLIPModel.from_pretrained(args.model_version, subfolder="clip_image_encoder")
+            clip_model = CLIPModel.from_pretrained(args.pretrained_path, subfolder="clip_image_encoder")
             self.vision_model = clip_model.vision_model
             self.visual_projection = clip_model.visual_projection
             self.vision_processor = T.Normalize(
@@ -1406,8 +1409,11 @@ def main(args):
     # Instantiate diffusers pipe as reference
     logger.info(
         f"Initializing StableDiffusionPipeline with {args.model_version}..")
-    pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4",
-                                                   use_auth_token=True)
+
+    if args.pretrained_path:
+        pipe = StableDiffusionPipeline.from_pretrained(args.pretrained_path, use_auth_token=True)
+    elif args.model_version:
+        pipe = StableDiffusionPipeline.from_pretrained(args.model_version, use_auth_token=True)
     logger.info("Done.")
 
     # Register the selected attention implementation globally
@@ -1495,6 +1501,11 @@ def parser_spec():
         ("The pre-trained model checkpoint and configuration to restore. "
          "For available versions: https://huggingface.co/models?search=stable-diffusion"
          ))
+    parser.add_argument(
+        "--pretrained-path",
+        default="",
+        help=("The pre-trained model checkpoint and configuration to restore. ")
+    )
     parser.add_argument("--compute-unit",
                         choices=tuple(cu
                                       for cu in ct.ComputeUnit._member_names_),
