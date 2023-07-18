@@ -55,8 +55,6 @@ public struct PostFuser: ResourceManaging {
         imageTokenMask: [Int32],
         numObjects: [Int32]
     ) throws -> MLShapedArray<Float32> {
-
-//        let numObjects = MLShapedArray<Int32>(scalars:[Int32(1)],shape:[1])
         let imageTokenMaskArray = MLShapedArray<Int32>(scalars: imageTokenMask, shape: [1, 77])
         let numObjectsArray = MLShapedArray<Int32>(scalars: numObjects, shape: [1])
         let dict = ["text_embeds": MLMultiArray(textEmbeddings),

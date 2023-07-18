@@ -55,16 +55,13 @@ public struct FeatureExtractor: ResourceManaging {
         }
         let dict = [inputName: MLMultiArray(imageData)]
         let input = try MLDictionaryFeatureProvider(dictionary: dict)
-        print("feature extractor inputShape: \(inputShape)")
-        print("feature extractor image shape: \(imageData.shape)")
         let result = try model.perform { model in
             try model.prediction(from: input)
         }
-        print("feature extractor  result.featureNames : \(result.featureNames)")
+
         let outputName = result.featureNames.first!
         let outputValue = result.featureValue(for: outputName)!.multiArrayValue!
         let output = MLShapedArray<Float32>(outputValue)
-        print("feature extractor  output shape : \(output.shape)")
         return output
     }
     

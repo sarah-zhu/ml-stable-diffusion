@@ -97,6 +97,9 @@ struct StableDiffusionSample: ParsableCommand {
 
     @Option(help: "The natural language script for the multilingual contextual embedding")
     var script: Script = .latin
+    
+    @Option(help: "special token used to indicate the position to concatenate object embedding (https://fastcomposer.mit.edu)")
+    var specialToken: String? = nil
 
     mutating func run() throws {
         guard FileManager.default.fileExists(atPath: resourcePath) else {
@@ -176,6 +179,7 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.guidanceScale = guidanceScale
         pipelineConfig.schedulerType = scheduler.stableDiffusionScheduler
         pipelineConfig.rngType = rng.stableDiffusionRNG
+        pipelineConfig.specialToken = specialToken
 
         let images = try pipeline.generateImages(
             configuration: pipelineConfig,

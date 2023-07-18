@@ -209,11 +209,11 @@ public struct StableDiffusionPipeline: ResourceManaging {
         
         var prompt: String
         var dict = [String: Any]()
+        
         // preprocess on the prompt
-//        if let specialToken = config.specialToken {
-        if true {
-            let specialToken = "<|image|></w>"
-            dict = preprocessPrompt(prompt: config.prompt, specialToken: specialToken)
+        if let specialToken = config.specialToken {
+            print("special token: \(specialToken)")
+            dict = preprocessPrompt(prompt: config.prompt, specialToken: specialToken+"</w>")
             prompt = dict["prompt"] as! String
         } else {
             prompt = config.prompt
@@ -229,18 +229,14 @@ public struct StableDiffusionPipeline: ResourceManaging {
         
         // extract features from image
         var fusedEmbedding: MLShapedArray<Float32>? = nil
-        if let featureExtractor, postFuser != nil, config.startingImage != nil {
+        if let featureExtractor, postFuser != nil, config.startingImage != nil, !dict.isEmpty {
             let imageEmebedding = try featureExtractor.encode(config.startingImage!)
-            print("promptEmbedding: \(promptEmbedding.shape)")
-            print("imageEmebedding: \(imageEmebedding.shape)")
             fusedEmbedding = try postFuser!.fuse(textEmbeddings: promptEmbedding, imageEmbeddings: imageEmebedding, imageTokenMask: dict["image_token_mask"] as! [Int32], numObjects: dict["numObjects"] as! [Int32])
-            print("post fuse output : \(promptEmbedding.shape)")
-            
+
             if reduceMemory {
                 featureExtractor.unloadResources()
                 postFuser?.unloadResources()
             }
-            
         }
         
         
@@ -310,7 +306,7 @@ public struct StableDiffusionPipeline: ResourceManaging {
             var noise = try unet.predictNoise(
                 latents: latentUnetInput,
                 timeStep: t,
-                hiddenStates: step < 10 ? hiddenStates : fusedHiddenStates!,
+                hiddenStates: (step < 10) || (fusedHiddenStates == nil) ? hiddenStates : fusedHiddenStates!,
                 additionalResiduals: additionalResiduals
             )
 
