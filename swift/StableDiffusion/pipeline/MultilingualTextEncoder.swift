@@ -47,6 +47,10 @@ public struct MultilingualTextEncoder: TextEncoderModel {
         adapter?.unloadResources()
         embeddingModel.unload()
     }
+    
+    public func getTokenMask(text: String, specialToken: String) -> [String: Any] {
+        return [String: Any]()
+    }
 
     /// Encodes the input text.
     ///
